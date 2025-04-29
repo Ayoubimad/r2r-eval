@@ -47,7 +47,7 @@ We are evaluating a Retrieval Augmented Generation (RAG) system with various con
 
 ## System Configuration
 - Using models:
-  - LLM: deepseek/ISTA-DASLab/gemma-3-4b-it-GPTQ-4b-128g
+  - LLM: ISTA-DASLab/gemma-3-4b-it-GPTQ-4b-128g
   - Embeddings: BAAI/bge-m3
 - Testing with a limit of 5 chunks per query
 - Various chunking strategies with configurable parameters 
