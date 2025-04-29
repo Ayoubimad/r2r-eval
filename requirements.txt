@@ -1,0 +1,5 @@
+langchain==0.3.23
+plotly==6.0.1
+r2r==3.5.14
+ragas==0.2.14
+RapidFuzz==3.13.0
