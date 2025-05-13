@@ -1,3 +1,12 @@
+"""
+Embeddings implementation module for the RAG evaluation framework.
+
+Used to Align with Chonkie Embeddings. Is a copy of the Chonkie Embeddings class.
+
+This module provides a generic embeddings implementation compatible with OpenAI API structure,
+which can be used with various embedding models and providers.
+"""
+
 import importlib.util as importutil
 import os
 import numpy as np
@@ -10,7 +19,23 @@ from openai import OpenAI
 
 
 class GenericEmbeddings(BaseEmbeddings):
-    """Generic embeddings implementation compatible with OpenAI API structure."""
+    """Generic embeddings implementation compatible with OpenAI API structure.
+
+    This class provides a consistent interface for embedding models that follow
+    the OpenAI API structure, supporting both OpenAI and third-party models.
+
+    Args:
+        model: Name of the embedding model to use
+        api_key: API key (if not provided, looks for OPENAI_API_KEY env var)
+        base_url: Base URL for API requests (for non-OpenAI providers)
+        organization: Optional organization ID for API requests
+        max_retries: Maximum number of retries for failed requests
+        timeout: Timeout in seconds for API requests
+        batch_size: Maximum number of texts to embed in one API call
+        embedding_dimension: The dimension of the embeddings (determined by model)
+        show_warnings: Whether to show warnings about token usage
+        **kwargs: Additional arguments to pass to the client initialization
+    """
 
     def __init__(
         self,
@@ -25,20 +50,7 @@ class GenericEmbeddings(BaseEmbeddings):
         show_warnings: bool = True,
         **kwargs,
     ):
-        """Initialize generic embeddings compatible with OpenAI API structure.
-
-        Args:
-            model: Name of the embedding model to use
-            api_key: API key (if not provided, looks for OPENAI_API_KEY env var)
-            base_url: Base URL for API requests (for non-OpenAI providers)
-            organization: Optional organization ID for API requests
-            max_retries: Maximum number of retries for failed requests
-            timeout: Timeout in seconds for API requests
-            batch_size: Maximum number of texts to embed in one API call
-            embedding_dimension: The dimension of the embeddings (determined by model)
-            show_warnings: Whether to show warnings about token usage
-            **kwargs: Additional arguments to pass to the client initialization
-        """
+        """Initialize generic embeddings compatible with OpenAI API structure."""
         super().__init__()
 
         self.model = model
@@ -76,6 +88,9 @@ class GenericEmbeddings(BaseEmbeddings):
 
         Returns:
             np.ndarray: Embedding vector for the text
+
+        Raises:
+            Exception: If embedding creation fails
         """
         if self._show_warnings:
             token_count = self.count_tokens(text)
@@ -114,6 +129,9 @@ class GenericEmbeddings(BaseEmbeddings):
 
         Returns:
             List[np.ndarray]: List of embedding vectors for each text
+
+        Raises:
+            Exception: If batch embedding fails and individual embedding also fails
         """
         if not texts:
             return []
@@ -191,6 +209,9 @@ class GenericEmbeddings(BaseEmbeddings):
 
         Returns:
             module: Numpy module
+
+        Raises:
+            ImportError: If numpy is not installed
         """
         try:
             import numpy as np

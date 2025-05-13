@@ -40,8 +40,71 @@ for approach, results in data.items():
             )
 df = pd.DataFrame(df_rows)
 
-# 1. Create radar charts for each strategy (comparing retrieval approaches)
+# Compute F1 scores for all strategies
+print("\nF1 Scores for All Strategies:")
+f1_scores = {}
+
 for strategy in strategies:
+    print(f"\n{strategy} Strategy:")
+    f1_scores[strategy] = {}
+
+    for approach, results in data.items():
+        precision = results[strategy]["context_precision"]
+        recall = results[strategy]["context_recall"]
+        # Calculate F1 score: 2 * (precision * recall) / (precision + recall)
+        if precision + recall > 0:  # Avoid division by zero
+            f1 = 2 * (precision * recall) / (precision + recall)
+        else:
+            f1 = 0
+        f1_scores[strategy][approach] = f1
+        print(f"{approach.replace('_', ' ').title()}: {f1:.4f}")
+
+# Create bar charts to visualize F1 scores for each strategy
+for strategy in strategies:
+    fig = go.Figure()
+
+    approaches = list(f1_scores[strategy].keys())
+    scores = list(f1_scores[strategy].values())
+
+    fig.add_trace(
+        go.Bar(
+            x=[approach.replace("_", " ").title() for approach in approaches],
+            y=scores,
+            text=[f"{score:.4f}" for score in scores],
+            textposition="outside",
+        )
+    )
+
+    # Find the best approach for this strategy
+    best_approach = max(approaches, key=lambda a: f1_scores[strategy][a])
+
+    strategy_display = (
+        "SDPM" if strategy == "Semantic_Double_Pass_Merging" else strategy
+    )
+
+    fig.update_layout(
+        title=f"F1 Scores for {strategy_display} Strategy (Precision-Recall Balance)",
+        xaxis_title="Retrieval Approach",
+        yaxis_title="F1 Score",
+        yaxis=dict(range=[0, 1]),
+        width=800,
+        height=600,  # Increased height to accommodate annotation
+        margin=dict(b=120),  # Increased bottom margin for annotation
+        showlegend=False,
+        annotations=[
+            dict(
+                x=0.5,
+                y=-0.2,  # Increased distance from bottom of plot
+                xref="paper",
+                yref="paper",
+                text=f"Best approach: {best_approach.replace('_', ' ').title()} (F1={f1_scores[strategy][best_approach]:.4f})",
+                showarrow=False,
+                font=dict(size=12, color="green"),
+            )
+        ],
+    )
+
+    fig.show()
     fig = go.Figure()
 
     for approach, results in data.items():
@@ -488,7 +551,7 @@ for strategy in strategies:
 
     fig.show()
 
-# 12. NEW: Create combined precision-recall plot with multiple strategies
+# 12. Create combined precision-recall plot with multiple strategies
 # For each retrieval approach, plot precision vs recall for all strategies
 for approach in retrieval_approaches.keys():
     display_name = approach.replace("_", " ").title()

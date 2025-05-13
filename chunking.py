@@ -1,6 +1,6 @@
 """
 Document chunking module that provides strategies for splitting documents into smaller chunks.
-Includes an LLM-based chunking strategy that uses AI to find natural breakpoints.
+Includes various chunking strategies using different techniques: fixed-size, semantic, and LLM-based.
 """
 
 from abc import ABC, abstractmethod
@@ -74,6 +74,45 @@ class ChunkingStrategy(ABC):
         cleaned_text = re.sub(r"[^\x00-\x7F]+", "", cleaned_text)
         return cleaned_text
 
+    def create_chunk_document(
+        self,
+        parent_document: Document,
+        chunk_content: str,
+        chunk_number: int,
+        strategy_name: str,
+    ) -> Document:
+        """Create a Document object for a chunk of text
+
+        Args:
+            parent_document: Original document being chunked
+            chunk_content: Content for this chunk
+            chunk_number: Index/number of this chunk
+            strategy_name: Name of the chunking strategy
+
+        Returns:
+            Document object representing the chunk
+        """
+        meta_data = (
+            parent_document.meta_data.copy() if parent_document.meta_data else {}
+        )
+
+        meta_data["chunk"] = chunk_number
+        meta_data["chunk_size"] = len(chunk_content)
+        meta_data["splitter_type"] = strategy_name
+
+        chunk_id = None
+        if parent_document.id:
+            chunk_id = f"{parent_document.id}_{chunk_number}"
+        elif parent_document.name:
+            chunk_id = f"{parent_document.name}_{chunk_number}"
+
+        return Document(
+            id=chunk_id,
+            name=parent_document.name,
+            meta_data=meta_data,
+            content=chunk_content,
+        )
+
 
 class LangChainChunking(ChunkingStrategy):
     """Chunking strategy that uses LangChain text splitters."""
@@ -103,6 +142,7 @@ class LangChainChunking(ChunkingStrategy):
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
         self.kwargs = kwargs
+        self.splitter_type = splitter_type
 
         if separators is None:
             separators = ["\n\n", "\n", ". ", " ", ""]
@@ -148,32 +188,17 @@ class LangChainChunking(ChunkingStrategy):
             return [document]
 
         clean_content = self.clean_text(document.content)
-
         text_chunks = self.splitter.split_text(clean_content)
 
-        chunks: List[Document] = []
-        for i, chunk_content in enumerate(text_chunks, 1):
-            meta_data = document.meta_data.copy()
-            meta_data["chunk"] = i
-            meta_data["chunk_size"] = len(chunk_content)
-            meta_data["splitter_type"] = self.splitter.__class__.__name__
-
-            chunk_id = None
-            if document.id:
-                chunk_id = f"{document.id}_{i}"
-            elif document.name:
-                chunk_id = f"{document.name}_{i}"
-
-            chunks.append(
-                Document(
-                    id=chunk_id,
-                    name=document.name,
-                    meta_data=meta_data,
-                    content=chunk_content,
-                )
+        return [
+            self.create_chunk_document(
+                parent_document=document,
+                chunk_content=chunk_content,
+                chunk_number=i,
+                strategy_name=self.splitter.__class__.__name__,
             )
-
-        return chunks
+            for i, chunk_content in enumerate(text_chunks, 1)
+        ]
 
     async def chunk_async(self, document: Document) -> List[Document]:
         """Split text into chunks asynchronously using LangChain text splitters.
@@ -184,122 +209,24 @@ class LangChainChunking(ChunkingStrategy):
         Returns:
             List of Document objects representing the chunks
         """
-        if len(document.content) <= self.chunk_size:
-            return [document]
-
-        clean_content = self.clean_text(document.content)
-
-        text_chunks = self.splitter.split_text(clean_content)
-
-        chunks: List[Document] = []
-        for i, chunk_content in enumerate(text_chunks, 1):
-            meta_data = document.meta_data.copy()
-            meta_data["chunk"] = i
-            meta_data["chunk_size"] = len(chunk_content)
-            meta_data["splitter_type"] = self.splitter.__class__.__name__
-
-            chunk_id = None
-            if document.id:
-                chunk_id = f"{document.id}_{i}"
-            elif document.name:
-                chunk_id = f"{document.name}_{i}"
-
-            chunks.append(
-                Document(
-                    id=chunk_id,
-                    name=document.name,
-                    meta_data=meta_data,
-                    content=chunk_content,
-                )
-            )
-
-        return chunks
+        return self.chunk(document)
 
 
-class AgenticChunking(ChunkingStrategy):
-    """Chunking strategy that uses an LLM to determine natural breakpoints in the text"""
+class PromptTemplateManager:
+    """Manager for generating prompts for LLM-based chunking"""
 
-    def __init__(self, model: ChatOpenAI, max_chunk_size: int = 32000):
-        self.max_chunk_size = max_chunk_size
-        self.model = model
+    @staticmethod
+    def create_breakpoint_prompt(text: str, max_chunk_size: int) -> str:
+        """
+        Create a prompt for finding a natural breakpoint in text.
 
-    def _prepare_chunk(
-        self, document: Document, chunk_text: str, chunk_number: int
-    ) -> Document:
-        """Create a Document object for a chunk of text"""
-        meta_data = document.meta_data.copy() if document.meta_data else {}
-        meta_data["chunk"] = chunk_number
-        meta_data["chunk_size"] = len(chunk_text)
-        meta_data["splitter_type"] = "agentic"
+        Args:
+            text: Text to analyze for breakpoints
+            max_chunk_size: Maximum chunk size to consider
 
-        chunk_id = None
-        if document.id:
-            chunk_id = f"{document.id}_{chunk_number}"
-        elif document.name:
-            chunk_id = f"{document.name}_{chunk_number}"
-
-        return Document(
-            id=chunk_id,
-            name=document.name,
-            meta_data=meta_data,
-            content=chunk_text,
-        )
-
-    def chunk(self, document: Document) -> List[Document]:
-        """Split text into chunks using LLM to determine natural breakpoints based on context"""
-        if len(document.content) <= self.max_chunk_size:
-            return [document]
-
-        chunks: List[Document] = []
-        remaining_text = self.clean_text(document.content)
-        chunk_number = 1
-
-        while remaining_text:
-            prompt = self._create_breakpoint_prompt(remaining_text)
-            try:
-                break_point = int(self.model.generate(prompt).strip())
-            except Exception:
-                break_point = self.max_chunk_size
-
-            chunk_text = remaining_text[:break_point].strip()
-            chunks.append(self._prepare_chunk(document, chunk_text, chunk_number))
-            chunk_number += 1
-            remaining_text = remaining_text[break_point:].strip()
-
-            if not remaining_text:
-                break
-
-        return chunks
-
-    async def chunk_async(self, document: Document) -> List[Document]:
-        """Split text into chunks asynchronously using LLM to determine natural breakpoints"""
-        if len(document.content) <= self.max_chunk_size:
-            return [document]
-
-        chunks: List[Document] = []
-        remaining_text = self.clean_text(document.content)
-        chunk_number = 1
-
-        while remaining_text:
-            prompt = self._create_breakpoint_prompt(remaining_text)
-
-            try:
-                break_point = int((await self.model.generate_async(prompt)).strip())
-            except Exception:
-                break_point = self.max_chunk_size
-
-            chunk_text = remaining_text[:break_point].strip()
-            chunks.append(self._prepare_chunk(document, chunk_text, chunk_number))
-            chunk_number += 1
-            remaining_text = remaining_text[break_point:].strip()
-
-            if not remaining_text:
-                break
-
-        return chunks
-
-    def _create_breakpoint_prompt(self, text: str) -> str:
-        """Create a prompt for finding a natural breakpoint in text."""
+        Returns:
+            Formatted prompt for an LLM
+        """
         return f"""You are an expert in natural language understanding. Your task is to find the most natural breakpoint in the **given text below**, counting characters **starting from the beginning of this text only** (i.e., character 0 is the first character shown).
 
         A good breakpoint is one that:
@@ -318,8 +245,130 @@ class AgenticChunking(ChunkingStrategy):
         634  
         789
 
-        Now analyze the following text and return the best breakpoint index:\n\n{text[:self.max_chunk_size]}
+        Now analyze the following text and return the best breakpoint index:\n\n{text[:max_chunk_size]}
         """
+
+
+class AgenticChunking(ChunkingStrategy):
+    """Chunking strategy that uses an LLM to determine natural breakpoints in the text"""
+
+    def __init__(self, model: ChatOpenAI, max_chunk_size: int = 32000):
+        """
+        Initialize the agentic chunking strategy
+
+        Args:
+            model: LLM model to use for determining breakpoints
+            max_chunk_size: Maximum chunk size in characters
+        """
+        self.max_chunk_size = max_chunk_size
+        self.model = model
+        self.prompt_manager = PromptTemplateManager()
+
+    def chunk(self, document: Document) -> List[Document]:
+        """
+        Split text into chunks using LLM to determine natural breakpoints based on context
+
+        Args:
+            document: Document to chunk
+
+        Returns:
+            List of document chunks
+        """
+        if len(document.content) <= self.max_chunk_size:
+            return [document]
+
+        chunks: List[Document] = []
+        remaining_text = self.clean_text(document.content)
+        chunk_number = 1
+
+        while remaining_text:
+            breakpoint_index = self._get_breakpoint(remaining_text)
+
+            chunk_text = remaining_text[:breakpoint_index].strip()
+            chunks.append(
+                self.create_chunk_document(
+                    parent_document=document,
+                    chunk_content=chunk_text,
+                    chunk_number=chunk_number,
+                    strategy_name="agentic",
+                )
+            )
+
+            chunk_number += 1
+            remaining_text = remaining_text[breakpoint_index:].strip()
+
+        return chunks
+
+    def _get_breakpoint(self, text: str) -> int:
+        """
+        Get a natural breakpoint in text using the LLM
+
+        Args:
+            text: Text to analyze
+
+        Returns:
+            Character index where text should be split
+        """
+        prompt = self.prompt_manager.create_breakpoint_prompt(text, self.max_chunk_size)
+
+        try:
+            break_point = int(self.model.generate(prompt).strip())
+            return min(break_point, self.max_chunk_size, len(text))
+        except Exception:
+            return min(self.max_chunk_size, len(text))
+
+    async def chunk_async(self, document: Document) -> List[Document]:
+        """
+        Split text into chunks asynchronously using LLM to determine natural breakpoints
+
+        Args:
+            document: Document to chunk
+
+        Returns:
+            List of document chunks
+        """
+        if len(document.content) <= self.max_chunk_size:
+            return [document]
+
+        chunks: List[Document] = []
+        remaining_text = self.clean_text(document.content)
+        chunk_number = 1
+
+        while remaining_text:
+            breakpoint_index = await self._get_breakpoint_async(remaining_text)
+
+            chunk_text = remaining_text[:breakpoint_index].strip()
+            chunks.append(
+                self.create_chunk_document(
+                    parent_document=document,
+                    chunk_content=chunk_text,
+                    chunk_number=chunk_number,
+                    strategy_name="agentic",
+                )
+            )
+
+            chunk_number += 1
+            remaining_text = remaining_text[breakpoint_index:].strip()
+
+        return chunks
+
+    async def _get_breakpoint_async(self, text: str) -> int:
+        """
+        Get a natural breakpoint in text using the LLM asynchronously
+
+        Args:
+            text: Text to analyze
+
+        Returns:
+            Character index where text should be split
+        """
+        prompt = self.prompt_manager.create_breakpoint_prompt(text, self.max_chunk_size)
+
+        try:
+            break_point = int((await self.model.generate_async(prompt)).strip())
+            return min(break_point, self.max_chunk_size, len(text))
+        except Exception:
+            return min(self.max_chunk_size, len(text))
 
 
 class SemanticChunker(ChunkingStrategy):
@@ -331,6 +380,14 @@ class SemanticChunker(ChunkingStrategy):
         chunk_size: int = 256,
         threshold: float = 0.5,
     ):
+        """
+        Initialize the semantic chunking strategy
+
+        Args:
+            embedding_model: Embeddings model for semantic comparison
+            chunk_size: Target chunk size in words
+            threshold: Similarity threshold for chunk boundaries
+        """
         self.chunk_size = chunk_size
         self.embedding_model = embedding_model
         self.threshold = threshold
@@ -341,26 +398,49 @@ class SemanticChunker(ChunkingStrategy):
         )
 
     def chunk(self, document: Document) -> List[Document]:
-        """Split text into chunks using semantic search to determine natural breakpoints"""
+        """
+        Split text into chunks using semantic search to determine natural breakpoints
+
+        Args:
+            document: Document to chunk
+
+        Returns:
+            List of document chunks
+        """
         if len(document.content) <= self.chunk_size:
             return [document]
 
-        chunks: List[Document] = []
         text = self.clean_text(document.content)
-        chunks = self.chunker.chunk(text)
+        semantic_chunks = self.chunker.chunk(text)
 
         return [
-            Document(content=chunk.text, meta_data=document.meta_data)
-            for chunk in chunks
+            self.create_chunk_document(
+                parent_document=document,
+                chunk_content=chunk.text,
+                chunk_number=i,
+                strategy_name="semantic",
+            )
+            for i, chunk in enumerate(semantic_chunks, 1)
         ]
 
     async def chunk_async(self, document: Document) -> List[Document]:
-        """Split text into chunks asynchronously using semantic search to determine natural breakpoints"""
+        """
+        Split text into chunks asynchronously using semantic search
+
+        Args:
+            document: Document to chunk
+
+        Returns:
+            List of document chunks
+        """
         return self.chunk(document)
 
 
 class SDPMChunker(ChunkingStrategy):
-    """Chunking strategy that uses semantic search to determine natural breakpoints in the text"""
+    """
+    Chunking strategy that uses Semantic Double Pass Merging to determine
+    natural breakpoints in the text
+    """
 
     def __init__(
         self,
@@ -369,6 +449,15 @@ class SDPMChunker(ChunkingStrategy):
         min_chunk_size: int = 8,
         threshold: float = 0.5,
     ):
+        """
+        Initialize the SDPM chunking strategy
+
+        Args:
+            embedding_model: Embeddings model for semantic comparison
+            chunk_size: Target chunk size in words
+            min_chunk_size: Minimum chunk size in words
+            threshold: Similarity threshold for chunk boundaries
+        """
         self.chunk_size = chunk_size
         self.min_chunk_size = min_chunk_size
         self.embedding_model = embedding_model
@@ -381,20 +470,40 @@ class SDPMChunker(ChunkingStrategy):
         )
 
     def chunk(self, document: Document) -> List[Document]:
-        """Split text into chunks using semantic search to determine natural breakpoints"""
+        """
+        Split text into chunks using SDPM to determine natural breakpoints
+
+        Args:
+            document: Document to chunk
+
+        Returns:
+            List of document chunks
+        """
         if len(document.content) <= self.chunk_size:
             return [document]
 
-        chunks: List[Document] = []
         text = self.clean_text(document.content)
-        chunks = self.chunker.chunk(text)
+        sdpm_chunks = self.chunker.chunk(text)
 
         return [
-            Document(content=chunk.text, meta_data=document.meta_data)
-            for chunk in chunks
-            if len(chunk.text) > 0
+            self.create_chunk_document(
+                parent_document=document,
+                chunk_content=chunk.text,
+                chunk_number=i,
+                strategy_name="sdpm",
+            )
+            for i, chunk in enumerate(sdpm_chunks, 1)
+            if chunk.text.strip()
         ]
 
     async def chunk_async(self, document: Document) -> List[Document]:
-        """Split text into chunks asynchronously using semantic search to determine natural breakpoints"""
+        """
+        Split text into chunks asynchronously using SDPM
+
+        Args:
+            document: Document to chunk
+
+        Returns:
+            List of document chunks
+        """
         return self.chunk(document)

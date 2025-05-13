@@ -1,215 +1,269 @@
+"""
+Main entry point for the RAG evaluation framework.
+
+This module provides the main functionality for running evaluations of
+different RAG configurations, chunking strategies, and search approaches.
+"""
+
 import json
 import time
 import asyncio
-from typing import List, Dict
-from ragas.integrations.r2r import transform_to_ragas_dataset
-import logging
-import colorlog
 import os
+from typing import List, Dict, Any, Optional, Tuple, Set
+import ast
 
-from config import RAGConfig, RAGGenerationConfig, SearchSettings
+from ragas.integrations.r2r import transform_to_ragas_dataset
+
+from config import RAGConfig, RAGGenerationConfig, SearchSettings, MetricsConfig
 from r2r_tester import RAGTester
-from metrics import MetricsEvaluator, MetricsConfig
-from chunking import LangChainChunking, AgenticChunking, ChunkingStrategy
+from metrics import MetricsEvaluator
+from chunking import (
+    LangChainChunking,
+    AgenticChunking,
+    ChunkingStrategy,
+    SemanticChunker,
+    SDPMChunker,
+)
+from chunk_enrichment import ChunkEnrichmentStrategy
 from document import Document
 from langchain_openai import ChatOpenAI
 from generic_embeddings import GenericEmbeddings
-from chunking import SemanticChunker, SDPMChunker
+from utils import create_logger
 
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-
-console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.INFO)
-
-colors = {
-    "DEBUG": "cyan",
-    "INFO": "green",
-    "WARNING": "yellow",
-    "ERROR": "red",
-    "CRITICAL": "red,bg_white",
-}
-
-formatter = colorlog.ColoredFormatter(
-    "%(asctime)s - %(log_color)s%(levelname)s%(reset)s - %(message)s",
-    log_colors=colors,
-    reset=True,
-    style="%",
-)
-
-console_handler.setFormatter(formatter)
-logger.addHandler(console_handler)
+logger = create_logger("main")
 
 
 async def run_rag_evaluation(
     dataset_path: str,
     config: RAGConfig,
     metrics_config: MetricsConfig,
-    chunker: ChunkingStrategy = LangChainChunking(),
-    documents_dir: str = None,
+    chunker: ChunkingStrategy,
+    documents_dir: Optional[str] = None,
     ingest_chunks: bool = True,
     delete_chunks: bool = True,
-):
-    """Main async function to run the complete RAG evaluation"""
-    logger.info(f"Starting evaluation with config: {config}")
+    enrich_chunks: bool = False,
+    enrichment_strategy: Optional[ChunkEnrichmentStrategy] = None,
+) -> Dict[str, Any]:
+    """
+    Main async function to run the complete RAG evaluation.
 
-    # Initialize stats dictionary to track timing and metrics
-    stats = {
-        "start_time": time.time(),
-        "chunking_strategy": chunker.__class__.__name__,
-        "retrieval_approach": (
-            config.search_settings.search_strategy
-            if config.search_settings.search_strategy
-            else "semantic_search"
-        ),
-        "document_count": 0,
-        "total_chunks": 0,
-        "avg_chunks_per_doc": 0,
-        "delete_docs_time": 0,
-        "chunking_time": 0,
-        "ingestion_time": 0,
-        "query_processing_time": 0,
-        "evaluation_time": 0,
-        "total_time": 0,
-    }
+    Args:
+        dataset_path: Path to the dataset file
+        config: RAG configuration
+        metrics_config: Metrics evaluation configuration
+        chunker: Chunking strategy to use
+        documents_dir: Directory containing documents to process
+        ingest_chunks: Whether to ingest chunks into the RAG system
+        delete_chunks: Whether to delete existing chunks before ingestion
+        enrich_chunks: Whether to enrich chunks with context
+        enrichment_strategy: Strategy for chunk enrichment
 
+    Returns:
+        Dictionary containing evaluation results
+    """
     async with RAGTester() as tester:
-
         if delete_chunks:
-            delete_start = time.time()
             await tester.delete_all_documents()
-            stats["delete_docs_time"] = time.time() - delete_start
 
-        logger.info(f"Loading dataset from {dataset_path}")
-        with open(dataset_path, "r") as f:
-            dataset = json.load(f)
-
-        user_inputs = dataset["user_input"]
-        references = dataset["reference"]
-        reference_contexts = dataset["reference_contexts"]
-
-        if ingest_chunks:
-            chunking_start = time.time()
-            total_chunks = 0
-
-            if documents_dir:
-                logger.info(f"Loading documents from {documents_dir}")
-                files = [
-                    f
-                    for f in os.listdir(documents_dir)
-                    if os.path.isfile(os.path.join(documents_dir, f))
-                ]
-                stats["document_count"] = len(files)
-                logger.info(f"Found {len(files)} files in {documents_dir}")
-
-                semaphore = asyncio.Semaphore(os.cpu_count() * 4)
-
-                all_chunk_counts = []
-
-                async def process_file(file):
-                    nonlocal total_chunks
-                    async with semaphore:
-                        file_path = os.path.join(documents_dir, file)
-                        logger.info(f"Processing document: {file}")
-
-                        try:
-                            with open(file_path, "r") as f:
-                                document = Document(content=f.read(), name=file)
-
-                            per_file_chunking_start = time.time()
-                            chunks = await chunker.chunk_async(document)
-                            chunk_count = len(chunks)
-                            all_chunk_counts.append(chunk_count)
-
-                            ingestion_start = time.time()
-                            await tester.ingest_chunks(
-                                [chunk.content for chunk in chunks]
-                            )
-                            ingestion_end = time.time()
-
-                            # Track statistics
-                            total_chunks += chunk_count
-
-                            return {
-                                "file": file,
-                                "chunk_count": chunk_count,
-                                "chunking_time": ingestion_start
-                                - per_file_chunking_start,
-                                "ingestion_time": ingestion_end - ingestion_start,
-                            }
-
-                        except Exception as e:
-                            logger.error(f"Error processing {file}: {str(e)}")
-                            return {"file": file, "error": str(e)}
-
-                tasks = [process_file(file) for file in files]
-                file_results = await asyncio.gather(*tasks)
-
-                # Calculate statistics
-                stats["chunking_time"] = time.time() - chunking_start
-                stats["total_chunks"] = total_chunks
-                if stats["document_count"] > 0:
-                    stats["avg_chunks_per_doc"] = total_chunks / stats["document_count"]
-
-                # Calculate ingestion time from file_results
-                total_ingestion_time = sum(
-                    result.get("ingestion_time", 0)
-                    for result in file_results
-                    if "ingestion_time" in result
-                )
-                stats["ingestion_time"] = total_ingestion_time
-
-                # Store detailed per-file results
-                stats["per_file_results"] = file_results
-
-        query_start = time.time()
-        r2r_responses = await tester.process_rag_queries(user_inputs, config)
-        stats["query_processing_time"] = time.time() - query_start
-
-        # Filter out user inputs, references, and contexts where we have no response
-        valid_indices = [i for i, resp in enumerate(r2r_responses) if resp]
-
-        if len(valid_indices) < len(user_inputs):
-            logger.warning(
-                f"Filtering out {len(user_inputs) - len(valid_indices)} failed queries from evaluation"
-            )
-            filtered_user_inputs = [user_inputs[i] for i in valid_indices]
-            filtered_references = [references[i] for i in valid_indices]
-            filtered_reference_contexts = [reference_contexts[i] for i in valid_indices]
-            filtered_r2r_responses = [r for r in r2r_responses if r]
-        else:
-            filtered_user_inputs = user_inputs
-            filtered_references = references
-            filtered_reference_contexts = reference_contexts
-            filtered_r2r_responses = r2r_responses
-
-        logger.info(f"Evaluating {len(filtered_user_inputs)} results...")
-        eval_start = time.time()
-        ragas_eval_dataset = transform_to_ragas_dataset(
-            user_inputs=filtered_user_inputs,
-            r2r_responses=filtered_r2r_responses,
-            references=filtered_references,
-            reference_contexts=filtered_reference_contexts,
+        dataset = load_dataset(dataset_path)
+        user_inputs, references, reference_contexts = extract_dataset_components(
+            dataset
         )
 
-        evaluator = MetricsEvaluator(metrics_config)
-        results = evaluator.evaluate_dataset(ragas_eval_dataset)
-        stats["evaluation_time"] = time.time() - eval_start
+        if ingest_chunks and documents_dir:
+            await process_and_ingest_documents(
+                tester,
+                documents_dir,
+                chunker,
+                enrich_chunks=enrich_chunks,
+                enrichment_strategy=enrichment_strategy,
+            )
+
+        r2r_responses = await tester.process_rag_queries(user_inputs, config)
+
+        filtered_inputs, filtered_refs, filtered_contexts, filtered_responses = (
+            filter_failed_queries(
+                user_inputs, references, reference_contexts, r2r_responses
+            )
+        )
+
+        logger.info(f"Evaluating {len(filtered_inputs)} results...")
+
+        results = evaluate_responses(
+            filtered_inputs,
+            filtered_responses,
+            filtered_refs,
+            filtered_contexts,
+            metrics_config,
+        )
 
         logger.info(f"Evaluation results: {results}")
 
-        # Calculate total time
-        stats["total_time"] = time.time() - stats["start_time"]
+        return results
 
-        # Add the stats to the results
-        results_with_stats = {
-            "metrics": results,
-            "stats": stats,
-        }
 
-        logger.info(f"Timing stats: {stats}")
+async def process_and_ingest_documents(
+    tester: RAGTester,
+    documents_dir: str,
+    chunker: ChunkingStrategy,
+    enrich_chunks: bool = False,
+    enrichment_strategy: Optional[ChunkEnrichmentStrategy] = None,
+) -> None:
+    """
+    Process documents and ingest chunks into the RAG system.
 
-        return results_with_stats
+    Args:
+        tester: RAG tester instance
+        documents_dir: Directory containing documents to process
+        chunker: Chunking strategy to use
+        enrich_chunks: Whether to enrich chunks with context
+        enrichment_strategy: Strategy for chunk enrichment
+    """
+    logger.info(f"Loading documents from {documents_dir}")
+    files = [
+        f
+        for f in os.listdir(documents_dir)
+        if os.path.isfile(os.path.join(documents_dir, f))
+    ]
+    logger.info(f"Found {len(files)} files in {documents_dir}")
+
+    semaphore = asyncio.Semaphore(16)
+
+    async def process_file(file):
+        async with semaphore:
+            file_path = os.path.join(documents_dir, file)
+            logger.info(f"Processing document: {file}")
+
+            try:
+                with open(file_path, "r") as f:
+                    document = Document(content=f.read(), name=file)
+
+                chunks = await chunker.chunk_async(document)
+                chunk_contents = [chunk.content for chunk in chunks]
+
+                if enrich_chunks and enrichment_strategy:
+                    logger.info(
+                        f"Enriching {len(chunk_contents)} chunks for document: {file}"
+                    )
+                    chunk_contents = await enrichment_strategy.enrich_chunks_async(
+                        chunk_contents
+                    )
+
+                await tester.ingest_chunks(chunk_contents)
+
+            except Exception as e:
+                logger.error(f"Error processing {file}: {str(e)}")
+
+    tasks = [process_file(file) for file in files]
+    await asyncio.gather(*tasks)
+
+
+def load_dataset(dataset_path: str) -> Dict[str, Any]:
+    """
+    Load the evaluation dataset from a file.
+
+    Args:
+        dataset_path: Path to the dataset file
+
+    Returns:
+        Loaded dataset
+    """
+    logger.info(f"Loading dataset from {dataset_path}")
+    with open(dataset_path, "r") as f:
+        dataset = json.load(f)
+    return dataset
+
+
+def extract_dataset_components(
+    dataset: Dict[str, Any],
+) -> Tuple[List[str], List[str], List[str]]:
+    """
+    Extract components from the dataset.
+
+    Args:
+        dataset: Dataset dictionary
+
+    Returns:
+        Tuple of (user_inputs, references, reference_contexts)
+    """
+    return (
+        dataset["user_input"],
+        dataset["reference"],
+        dataset["reference_contexts"],
+    )
+
+
+def filter_failed_queries(
+    user_inputs: List[str],
+    references: List[str],
+    reference_contexts: List[List[str]],
+    r2r_responses: List[Optional[str]],
+) -> Tuple[List[str], List[str], List[List[str]], List[str]]:
+    """
+    Filter out failed queries from the evaluation data.
+
+    Args:
+        user_inputs: List of user input queries
+        references: List of reference answers
+        reference_contexts: List of reference context sets
+        r2r_responses: List of RAG system responses
+
+    Returns:
+        Tuple of filtered (user_inputs, references, reference_contexts, responses)
+    """
+    valid_indices = [i for i, resp in enumerate(r2r_responses) if resp]
+
+    if len(valid_indices) < len(user_inputs):
+        logger.warning(
+            f"Filtering out {len(user_inputs) - len(valid_indices)} failed queries from evaluation"
+        )
+        filtered_user_inputs = [user_inputs[i] for i in valid_indices]
+        filtered_references = [references[i] for i in valid_indices]
+        filtered_reference_contexts = [reference_contexts[i] for i in valid_indices]
+        filtered_r2r_responses = [r for r in r2r_responses if r]
+    else:
+        filtered_user_inputs = user_inputs
+        filtered_references = references
+        filtered_reference_contexts = reference_contexts
+        filtered_r2r_responses = r2r_responses
+
+    return (
+        filtered_user_inputs,
+        filtered_references,
+        filtered_reference_contexts,
+        filtered_r2r_responses,
+    )
+
+
+def evaluate_responses(
+    user_inputs: List[str],
+    r2r_responses: List[str],
+    references: List[str],
+    reference_contexts: List[List[str]],
+    metrics_config: MetricsConfig,
+) -> Dict[str, Any]:
+    """
+    Evaluate RAG responses using RAGAS metrics.
+
+    Args:
+        user_inputs: List of user input queries
+        r2r_responses: List of RAG system responses
+        references: List of reference answers
+        reference_contexts: List of reference context sets
+        metrics_config: Metrics evaluation configuration
+
+    Returns:
+        Dictionary of evaluation results
+    """
+    ragas_eval_dataset = transform_to_ragas_dataset(
+        user_inputs=user_inputs,
+        r2r_responses=r2r_responses,
+        references=references,
+        reference_contexts=reference_contexts,
+    )
+
+    evaluator = MetricsEvaluator(metrics_config)
+    return evaluator.evaluate_dataset(ragas_eval_dataset)
 
 
 async def test_rag_configuration(
@@ -220,8 +274,26 @@ async def test_rag_configuration(
     ingest_chunks: bool = True,
     delete_chunks: bool = True,
     chunker: ChunkingStrategy = LangChainChunking(),
-):
-    """Test a single RAG configuration asynchronously"""
+    enrich_chunks: bool = False,
+    enrichment_strategy: Optional[ChunkEnrichmentStrategy] = None,
+) -> Dict[str, Any]:
+    """
+    Test a single RAG configuration asynchronously.
+
+    Args:
+        dataset_path: Path to the dataset file
+        documents_dir: Directory containing documents to process
+        config: RAG configuration
+        metrics_config: Metrics evaluation configuration
+        ingest_chunks: Whether to ingest chunks into the RAG system
+        delete_chunks: Whether to delete existing chunks before ingestion
+        chunker: Chunking strategy to use
+        enrich_chunks: Whether to enrich chunks with context
+        enrichment_strategy: Strategy for chunk enrichment
+
+    Returns:
+        Dictionary containing evaluation results
+    """
     return await run_rag_evaluation(
         dataset_path=dataset_path,
         documents_dir=documents_dir,
@@ -230,10 +302,267 @@ async def test_rag_configuration(
         ingest_chunks=ingest_chunks,
         delete_chunks=delete_chunks,
         chunker=chunker,
+        enrich_chunks=enrich_chunks,
+        enrichment_strategy=enrichment_strategy,
     )
 
 
-if __name__ == "__main__":
+def create_chunker(
+    chunker_type: str,
+    chunk_size: int,
+    embedding_base_url: str,
+    model_base_url: str,
+) -> ChunkingStrategy:
+    """
+    Create a chunker instance based on the chunker type and settings.
+
+    Args:
+        chunker_type: Type of chunker to create
+        chunk_size: Size of chunks to create
+        embedding_base_url: Base URL for embedding API
+        model_base_url: Base URL for LLM API
+
+    Returns:
+        Configured chunker instance
+    """
+    word_size = chunk_size // 4  # Approximate words for semantic chunkers
+    chunk_overlap = chunk_size // 4  # Standard 25% overlap
+
+    if chunker_type == "character":
+        chunker = LangChainChunking(
+            splitter_type="character",
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+        )
+        setattr(chunker, "chunker_type", "character")
+        return chunker
+    elif chunker_type == "recursive":
+        chunker = LangChainChunking(
+            splitter_type="recursive",
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+        )
+        setattr(chunker, "chunker_type", "recursive")
+        return chunker
+    elif chunker_type == "semantic":
+        chunker = SemanticChunker(
+            embedding_model=GenericEmbeddings(
+                model="BAAI/bge-m3",
+                api_key="random_api_key",
+                base_url=embedding_base_url,
+                embedding_dimension=1024,
+            ),
+            chunk_size=word_size,  # This is in words
+            threshold=0.5,
+        )
+        setattr(chunker, "chunker_type", "semantic")
+        return chunker
+    elif chunker_type == "sdpm":
+        chunker = SDPMChunker(
+            embedding_model=GenericEmbeddings(
+                model="BAAI/bge-m3",
+                api_key="random_api_key",
+                base_url=embedding_base_url,
+                embedding_dimension=1024,
+            ),
+            chunk_size=word_size,
+            threshold=0.5,
+        )
+        setattr(chunker, "chunker_type", "sdpm")
+        return chunker
+    elif chunker_type == "agentic":
+        chunker = AgenticChunking(
+            model=ChatOpenAI(
+                model="ISTA-DASLab/gemma-3-4b-it-GPTQ-4b-128g",
+                base_url=model_base_url,
+                temperature=0.0,
+                max_tokens=50000,
+                api_key="random_api_key",
+            ),
+            max_chunk_size=chunk_size,
+        )
+        setattr(chunker, "chunker_type", "agentic")
+        return chunker
+    else:
+        raise ValueError(f"Unknown chunker type: {chunker_type}")
+
+
+def run_chunk_size_test(
+    chunk_size: int,
+    search_settings_dict: Dict[str, Dict[str, Any]],
+    chunker_types: Set[str],
+    generation_config: RAGGenerationConfig,
+    metrics_config: MetricsConfig,
+    output_prefix: str,
+    documents_dir: str,
+    dataset_path: str,
+    max_retries: int = 3,
+    enrich_chunks: bool = False,
+    enrichment_strategy: ChunkEnrichmentStrategy = None,
+) -> Dict[str, Any]:
+    """
+    Run tests for a specific chunk size across multiple chunker types and all search strategies.
+    """
+    chunkers = {}
+
+    if "character" in chunker_types:
+        chunker = create_chunker(
+            "character",
+            chunk_size,
+            metrics_config.embeddings_api_base,
+            generation_config.api_base,
+        )
+        setattr(chunker, "chunker_type", "character")
+        chunkers["character"] = chunker
+
+    if "recursive" in chunker_types:
+        chunker = create_chunker(
+            "recursive",
+            chunk_size,
+            metrics_config.embeddings_api_base,
+            generation_config.api_base,
+        )
+        setattr(chunker, "chunker_type", "recursive")
+        chunkers["recursive"] = chunker
+
+    if "semantic" in chunker_types:
+        chunker = create_chunker(
+            "semantic",
+            chunk_size,
+            metrics_config.embeddings_api_base,
+            generation_config.api_base,
+        )
+        setattr(chunker, "chunker_type", "semantic")
+        chunkers["semantic"] = chunker
+
+    if "sdpm" in chunker_types:
+        chunker = create_chunker(
+            "sdpm",
+            chunk_size,
+            metrics_config.embeddings_api_base,
+            generation_config.api_base,
+        )
+        setattr(chunker, "chunker_type", "sdpm")
+        chunkers["Semantic_Double_Pass_Merging"] = chunker
+
+    if "agentic" in chunker_types:
+        chunker = create_chunker(
+            "agentic",
+            chunk_size,
+            metrics_config.embeddings_api_base,
+            generation_config.api_base,
+        )
+        setattr(chunker, "chunker_type", "agentic")
+        chunkers["agentic"] = chunker
+
+    output_file = f"{output_prefix}_{chunk_size}.json"
+    all_results = {}
+
+    try:
+        for chunker_name, chunker in chunkers.items():
+            logger.info(f'Ingesting documents with chunker "{chunker_name}"')
+            # Ingest chunks ONCE for this chunker, after deleting previous chunks
+            ingestion_success = False
+            for attempt in range(max_retries):
+                try:
+                    # Use a dummy config, only for ingestion
+                    dummy_config = RAGConfig(
+                        generation_config=generation_config,
+                        search_settings=list(search_settings_dict.values())[0][
+                            "config"
+                        ],
+                        search_mode=list(search_settings_dict.values())[0]["mode"],
+                    )
+
+                    async def delete_and_ingest():
+                        async with RAGTester() as tester:
+                            await tester.delete_all_documents()
+                            await process_and_ingest_documents(
+                                tester=tester,
+                                documents_dir=documents_dir,
+                                chunker=chunker,
+                                enrich_chunks=enrich_chunks,
+                                enrichment_strategy=enrichment_strategy,
+                            )
+
+                    import nest_asyncio
+
+                    nest_asyncio.apply()
+                    asyncio.run(delete_and_ingest())
+                    ingestion_success = True
+                    break
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        time.sleep(5)
+                    else:
+                        logger.error(
+                            f"All {max_retries} attempts failed for ingestion with {chunker_name}: {str(e)}"
+                        )
+                        all_results[chunker_name] = {
+                            "error": f"Ingestion failed: {str(e)}"
+                        }
+                        break
+            if not ingestion_success:
+                continue  # Skip to next chunker if ingestion failed
+
+            logger.info(
+                f'Starting RAG with search strategies: {", ".join(search_settings_dict.keys())}'
+            )
+            # Now run all search strategies WITHOUT re-ingesting
+            chunker_results = {}
+            for search_name, search_config in search_settings_dict.items():
+                logger.info(f'Starting RAG with "{search_name}"')
+                rag_config = RAGConfig(
+                    generation_config=generation_config,
+                    search_settings=search_config["config"],
+                    search_mode=search_config["mode"],
+                )
+                for attempt in range(max_retries):
+                    try:
+                        result = asyncio.run(
+                            test_rag_configuration(
+                                dataset_path=dataset_path,
+                                documents_dir=documents_dir,
+                                config=rag_config,
+                                metrics_config=metrics_config,
+                                chunker=chunker,
+                                ingest_chunks=False,
+                                delete_chunks=False,
+                                enrich_chunks=enrich_chunks,
+                                enrichment_strategy=enrichment_strategy,
+                            )
+                        )
+                        result_dict = ast.literal_eval(str(result))
+                        chunker_results[search_name] = result_dict
+                        break
+                    except Exception as e:
+                        if attempt < max_retries - 1:
+                            time.sleep(5)
+                        else:
+                            logger.error(
+                                f"All {max_retries} attempts failed for {chunker_name} with search {search_name}: {str(e)}"
+                            )
+                            chunker_results[search_name] = {
+                                "error": f"Failed after {max_retries} attempts: {str(e)}"
+                            }
+            all_results[chunker_name] = chunker_results
+
+        with open(output_file, "w") as f:
+            json.dump(all_results, f, indent=2, ensure_ascii=False)
+
+        return all_results
+
+    except Exception as e:
+        logger.error(f"Complete failure testing chunk size {chunk_size}: {str(e)}")
+        return {"error": str(e)}
+
+
+def main():
+    """Main entry point for the RAG evaluation framework."""
+
+    documents_dir = "/home/e4user/r2r-eval/data/pdfservers_md"
+    dataset_path = "/home/e4user/r2r-eval/datasets/ragas_testset_dell_servers.json"
+    output_prefix = "evaluation_results_dell_servers"
 
     generation_config = RAGGenerationConfig(
         model="deepseek/ISTA-DASLab/gemma-3-4b-it-GPTQ-4b-128g",
@@ -242,59 +571,41 @@ if __name__ == "__main__":
         max_tokens=50000,
     )
 
-    """
-    search_settings={
-        "search_strategy": "hyde",
-        "limit": 5,
-        "use_hybrid_search": False,
-        "graph_settings": {"enabled": False},
+    search_settings = {
+        "semantic_search": {
+            "config": SearchSettings(
+                limit=5,
+                graph_settings={"enabled": False},
+            ),
+            "mode": "basic",
+        },
+        "hybrid_search": {
+            "config": SearchSettings(
+                use_hybrid_search=True,
+                limit=5,
+                graph_settings={"enabled": False},
+            ),
+            "mode": "advanced",
+        },
+        "rag_fusion": {
+            "config": SearchSettings(
+                search_strategy="rag_fusion",
+                use_hybrid_search=False,
+                limit=5,
+                graph_settings={"enabled": False},
+            ),
+            "mode": None,
+        },
+        "hyde": {
+            "config": SearchSettings(
+                search_strategy="hyde",
+                use_hybrid_search=False,
+                limit=5,
+                graph_settings={"enabled": False},
+            ),
+            "mode": None,
+        },
     }
-
-    search_settings={
-        "search_strategy": "rag_fusion",
-        "limit": 5,
-        "use_hybrid_search": False,
-        "graph_settings": {"enabled": False},
-    }
-    """
-
-    """
-    search_settings = SearchSettings(
-        limit=5,
-        graph_settings={"enabled": False},
-    )
-    """
-
-    search_setting_hyde = SearchSettings(
-        search_strategy="hyde",
-        use_hybrid_search=False,
-        limit=5,
-        graph_settings={"enabled": False},
-    )
-
-    search_setting_rag_fusion = SearchSettings(
-        search_strategy="rag_fusion",
-        use_hybrid_search=False,
-        limit=5,
-        graph_settings={"enabled": False},
-    )
-
-    search_settings_semantic_search = SearchSettings(
-        limit=5,
-        graph_settings={"enabled": False},
-    )
-
-    search_settings_hybrid_search = SearchSettings(
-        limit=5,
-        graph_settings={"enabled": False},
-    )
-
-    search_settings_with_names = [
-        ("hyde", search_setting_hyde),
-        ("rag_fusion", search_setting_rag_fusion),
-        ("semantic_search", search_settings_semantic_search),
-        ("hybrid_search", search_settings_hybrid_search),
-    ]
 
     metrics_config = MetricsConfig(
         llm_model="ISTA-DASLab/gemma-3-4b-it-GPTQ-4b-128g",
@@ -303,279 +614,42 @@ if __name__ == "__main__":
         embeddings_api_base="http://172.18.21.126:8000/v1",
     )
 
-    # Define chunk sizes to test (doubling each time)
-    chunk_sizes = [128, 256, 512, 1024, 2048, 4096, 8192]
+    chunker_types = {
+        "semantic",
+        "sdpm",
+        "agentic",
+        "character",
+        "recursive",
+    }
 
-    # Keep track of failures for tests.md
-    chunk_size_results = {}
-
-    # We'll use semantic search for chunk size testing as it had the best performance
-    search_name = "semantic_search"
-    search_setting = search_settings_semantic_search
-
-    rag_config = RAGConfig(
-        generation_config=generation_config,
-        search_mode="basic",
-        search_settings=search_setting,
-        include_web_search=False,
+    enrichment_strategy = ChunkEnrichmentStrategy(
+        model="ISTA-DASLab/gemma-3-4b-it-GPTQ-4b-128g",
+        api_base="http://172.18.21.136:8000/v1",
+        temperature=0.8,
+        max_tokens=8192,
+        concurrency_limit=32,
+        n_chunks=2,
     )
 
-    # Test each chunk size
+    enable_chunk_enrichment = False
+
+    chunk_sizes = [1024]
+
     for chunk_size in chunk_sizes:
-        logger.info(f"======== Testing chunk size: {chunk_size} ========")
-        word_size = chunk_size // 4  # Approximate words for semantic chunkers
+        run_chunk_size_test(
+            chunk_size=chunk_size,
+            search_settings_dict=search_settings,
+            chunker_types=chunker_types,
+            generation_config=generation_config,
+            metrics_config=metrics_config,
+            output_prefix=output_prefix,
+            documents_dir=documents_dir,
+            dataset_path=dataset_path,
+            max_retries=3,
+            enrich_chunks=enable_chunk_enrichment,
+            enrichment_strategy=enrichment_strategy,
+        )
 
-        # Update chunk size result status
-        chunk_size_results[chunk_size] = {"status": "Running", "notes": ""}
 
-        chunkers = {
-            "character": LangChainChunking(
-                splitter_type="character",
-                chunk_size=chunk_size,
-                chunk_overlap=chunk_size // 4,
-            ),
-            "recursive": LangChainChunking(
-                splitter_type="recursive",
-                chunk_size=chunk_size,
-                chunk_overlap=chunk_size // 4,
-            ),
-        }
-
-        # Only include semantic and SDPM for sizes 32 and above
-        if chunk_size >= 32:
-            chunkers.update(
-                {
-                    "semantic": SemanticChunker(
-                        embedding_model=GenericEmbeddings(
-                            model="BAAI/bge-m3",
-                            api_key="random_api_key",
-                            base_url="http://172.18.21.126:8000/v1",
-                            embedding_dimension=1024,
-                        ),
-                        chunk_size=word_size,  # This is in words
-                        threshold=0.5,
-                    ),
-                    "Semantic_Double_Pass_Merging": SDPMChunker(
-                        embedding_model=GenericEmbeddings(
-                            model="BAAI/bge-m3",
-                            api_key="random_api_key",
-                            base_url="http://172.18.21.126:8000/v1",
-                            embedding_dimension=1024,
-                        ),
-                        chunk_size=word_size,
-                        threshold=0.5,
-                    ),
-                }
-            )
-
-        # Only include agentic for reasonable sizes (it's expensive for very small or large chunks)
-        if chunk_size >= 32 and chunk_size <= 8192:
-            chunkers["agentic"] = AgenticChunking(
-                model=ChatOpenAI(
-                    model="ISTA-DASLab/gemma-3-4b-it-GPTQ-4b-128gg",
-                    base_url="http://172.18.21.136:8000/v1",
-                    temperature=0.0,
-                    max_tokens=50000,
-                    api_key="random_api_key",
-                ),
-                max_chunk_size=chunk_size,
-            )
-
-        output_file = f"evaluation_results_{search_name}_chunk_size_{chunk_size}.json"
-        results = {}
-        stats_file = f"stats_{search_name}_chunk_size_{chunk_size}.json"
-        stats = {}
-        success = False
-        failure_reason = ""
-
-        try:
-            for chunker_name, chunker in chunkers.items():
-                logger.info(
-                    f"Running evaluation with {chunker_name} chunker for chunk size {chunk_size}..."
-                )
-
-                max_retries = 3  # Reduced retries for chunk size testing
-                retry_delay = 5
-
-                chunker_success = False
-                for attempt in range(max_retries):
-                    try:
-                        result = asyncio.run(
-                            test_rag_configuration(
-                                dataset_path="./datasets/ragas_generated_dataset.json",
-                                documents_dir="./data/output",
-                                config=rag_config,
-                                metrics_config=metrics_config,
-                                chunker=chunker,
-                                ingest_chunks=True,
-                                delete_chunks=True,
-                            )
-                        )
-                        chunker_success = True
-                        break
-                    except Exception as e:
-                        if attempt < max_retries - 1:
-                            logger.warning(
-                                f"Attempt {attempt + 1} failed for {chunker_name} with chunk size {chunk_size}: {str(e)}. Retrying in {retry_delay} seconds..."
-                            )
-                            time.sleep(retry_delay)
-                        else:
-                            logger.error(
-                                f"All {max_retries} attempts failed for chunker {chunker_name} with chunk size {chunk_size}: {str(e)}"
-                            )
-                            # Just record the failure, don't raise the exception
-
-                if chunker_success:
-                    import ast
-
-                    # Separate metrics and stats
-                    result_dict = ast.literal_eval(str(result))
-
-                    if (
-                        isinstance(result_dict, dict)
-                        and "metrics" in result_dict
-                        and "stats" in result_dict
-                    ):
-                        results[chunker_name] = result_dict["metrics"]
-                        stats[chunker_name] = result_dict["stats"]
-                    else:
-                        # For backward compatibility with previous result format
-                        results[chunker_name] = result_dict
-                        stats[chunker_name] = {"error": "No timing stats available"}
-                else:
-                    error_msg = f"Failed after {max_retries} attempts"
-                    results[chunker_name] = {"error": error_msg}
-                    stats[chunker_name] = {"error": error_msg}
-                    logger.warning(
-                        f"Skipping {chunker_name} for chunk size {chunk_size} due to errors"
-                    )
-
-            # Save results and stats to separate files
-            with open(output_file, "w") as f:
-                json.dump(results, f, indent=2)
-
-            with open(stats_file, "w") as f:
-                json.dump(stats, f, indent=2)
-
-            logger.info(f"Results for chunk size {chunk_size} saved to {output_file}")
-            logger.info(f"Statistics for chunk size {chunk_size} saved to {stats_file}")
-
-            success = True
-
-        except Exception as e:
-            failure_reason = str(e)
-            logger.error(
-                f"Complete failure testing chunk size {chunk_size}: {failure_reason}"
-            )
-
-        # Update tests.md with status
-        if success:
-            chunk_size_results[chunk_size] = {
-                "status": "Completed",
-                "notes": f"Results saved to {output_file}, stats saved to {stats_file}",
-            }
-        else:
-            chunk_size_results[chunk_size] = {
-                "status": "Failed",
-                "notes": f"Error: {failure_reason}",
-            }
-
-    # Update tests.md with results
-    with open("tests.md", "r") as f:
-        tests_md_content = f.read()
-
-    # Update chunk size testing table
-    chunk_size_table = (
-        "| Chunk Size | Status | Notes |\n|------------|--------|-------|\n"
-    )
-    for size in sorted(chunk_size_results.keys()):
-        result = chunk_size_results[size]
-        chunk_size_table += f"| {size} | {result['status']} | {result['notes']} |\n"
-
-    # Replace the existing table with the updated one
-    import re
-
-    pattern = r"## Chunk Size Testing.*?### Chunk Size Testing Results"
-    replacement = f"## Chunk Size Testing\nTests with varying chunk sizes to determine optimal chunking parameters for each approach.\n\n{chunk_size_table}\n### Chunk Size Testing Results"
-    tests_md_content = re.sub(pattern, replacement, tests_md_content, flags=re.DOTALL)
-
-    with open("tests.md", "w") as f:
-        f.write(tests_md_content)
-
-    logger.info(
-        "All chunk size tests completed. Results saved to individual files and tests.md updated."
-    )
-
-    # Previous testing code (commented out to focus on chunk size testing)
-    """
-    for search_name, search_setting in search_settings_with_names:
-        logger.info(f"Running evaluation with {search_name} search setting...")
-
-        if search_name == "semantic_search":
-            rag_config = RAGConfig(
-                generation_config=generation_config,
-                search_mode="basic",
-                search_settings=search_setting,
-                include_web_search=False,
-            )
-
-        elif search_name == "hybrid_search":
-            rag_config = RAGConfig(
-                generation_config=generation_config,
-                search_mode="advanced",
-                search_settings=search_setting,
-                include_web_search=False,
-            )
-        else:
-            rag_config = RAGConfig(
-                generation_config=generation_config,
-                search_settings=search_setting,
-                include_web_search=False,
-            )
-
-        output_file = f"evaluation_results_{search_name}.json"
-        results = {}
-
-        for chunker_name, chunker in chunkers.items():
-            logger.info(
-                f"Running evaluation with {chunker_name} chunker for {search_name}..."
-            )
-
-            max_retries = 10
-            retry_delay = 5
-
-            for attempt in range(max_retries):
-                try:
-                    result = asyncio.run(
-                        test_rag_configuration(
-                            dataset_path="./datasets/ragas_generated_dataset.json",
-                            documents_dir="./data/output",
-                            config=rag_config,
-                            metrics_config=metrics_config,
-                            chunker=chunker,
-                            ingest_chunks=True,
-                            delete_chunks=True,
-                        )
-                    )
-                    break
-                except Exception as e:
-                    if attempt < max_retries - 1:
-                        logger.warning(
-                            f"Attempt {attempt + 1} failed: {str(e)}. Retrying in {retry_delay} seconds..."
-                        )
-                        time.sleep(retry_delay)
-                    else:
-                        logger.error(
-                            f"All {max_retries} attempts failed for chunker {chunker_name}"
-                        )
-                        raise
-
-            import ast
-
-            result = ast.literal_eval(str(result))
-            results[chunker_name] = result
-
-        with open(output_file, "w") as f:
-            json.dump(results, f, indent=2)
-        logger.info(f"Results for {search_name} search setting saved to {output_file}")
-    """
+if __name__ == "__main__":
+    main()

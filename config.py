@@ -1,7 +1,12 @@
-from dataclasses import dataclass
-from typing import Dict, Any, Optional, Literal
-import colorlog
-import logging
+"""
+Configuration module for the RAG evaluation framework.
+
+This module provides data classes for configuration settings used throughout
+the evaluation framework, ensuring type safety and validation.
+"""
+
+from dataclasses import dataclass, field
+from typing import Dict, Any, Optional, Literal, List
 
 
 @dataclass
@@ -15,6 +20,7 @@ class RAGGenerationConfig:
     stream: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
+        """Convert configuration to dictionary format for API calls"""
         return {
             "model": self.model,
             "api_base": self.api_base,
@@ -36,6 +42,7 @@ class SearchSettings:
     graph_settings: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
+        """Convert configuration to dictionary format for API calls"""
         settings = {
             "limit": self.limit,
             "use_hybrid_search": self.use_hybrid_search,
@@ -67,7 +74,14 @@ class RAGConfig:
     def name(self) -> str:
         """Generate a short name for this configuration"""
         model_name = self.generation_config.model.split("/")[-1]
-        search_type = "hybrid" if self.search_settings.use_hybrid_search else "semantic"
+
+        if self.search_settings.search_strategy:
+            search_type = self.search_settings.search_strategy
+        elif self.search_settings.use_hybrid_search:
+            search_type = "hybrid"
+        else:
+            search_type = "semantic"
+
         return f"{model_name}_{search_type}_{self.search_settings.limit}"
 
     def to_rag_params(self) -> Dict[str, Any]:
@@ -86,31 +100,75 @@ class RAGConfig:
         return params
 
 
-def setup_logger() -> logging.Logger:
-    """Configure and return the logger"""
-    logger = logging.getLogger(__name__)
-    logger.setLevel(logging.INFO)
+@dataclass
+class MetricsConfig:
+    """Configuration for metrics evaluation"""
 
-    if not logger.handlers:
-        console_handler = logging.StreamHandler()
-        console_handler.setLevel(logging.INFO)
+    llm_model: str
+    llm_api_base: str
+    embeddings_model: str
+    embeddings_api_base: str
+    api_key_llm: str = "random_api_key"
+    api_key_embeddings: str = "random_api_key"
 
-        colors = {
-            "DEBUG": "cyan",
-            "INFO": "green",
-            "WARNING": "yellow",
-            "ERROR": "red",
-            "CRITICAL": "red,bg_white",
+
+@dataclass
+class TimingConfig:
+    """Configuration for timing measurements"""
+
+    enabled: bool = True
+    include_steps: List[str] = field(
+        default_factory=lambda: ["chunking", "ingestion", "retrieval", "evaluation"]
+    )
+
+
+@dataclass
+class ChunkEnrichmentSettings:
+    """Settings for chunk enrichment."""
+
+    enable_chunk_enrichment: bool = False
+    n_chunks: int = 2
+    generation_config: Optional[RAGGenerationConfig] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "enable_chunk_enrichment": self.enable_chunk_enrichment,
+            "n_chunks": self.n_chunks,
+            "generation_config": (
+                self.generation_config.to_dict() if self.generation_config else None
+            ),
         }
 
-        formatter = colorlog.ColoredFormatter(
-            "%(asctime)s - %(log_color)s%(levelname)s%(reset)s - %(message)s",
-            log_colors=colors,
-            reset=True,
-            style="%",
-        )
+    def __str__(self) -> str:
+        return f"enable_chunk_enrichment={self.enable_chunk_enrichment}, n_chunks={self.n_chunks}"
 
-        console_handler.setFormatter(formatter)
-        logger.addHandler(console_handler)
+    def __repr__(self) -> str:
+        return self.__str__()
 
-    return logger
+
+@dataclass
+class IngestionConfig:
+    """Configuration for ingestion"""
+
+    chunk_enrichment_settings: ChunkEnrichmentSettings = field(
+        default_factory=ChunkEnrichmentSettings
+    )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "chunk_enrichment": {
+                "enable_chunk_enrichment": self.chunk_enrichment_settings.enable_chunk_enrichment,
+                "n_chunks": self.chunk_enrichment_settings.n_chunks,
+                "generation_config": (
+                    self.chunk_enrichment_settings.generation_config.to_dict()
+                    if self.chunk_enrichment_settings.generation_config
+                    else None
+                ),
+            }
+        }
+
+    def __str__(self) -> str:
+        return f"ingestion_config={self.to_dict()}"
+
+    def __repr__(self) -> str:
+        return self.__str__()
